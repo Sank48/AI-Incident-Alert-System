@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Dummy Lambda to simulate error logs for AI alert testing
+
+Resources:
+  AIIncidentEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # TableName: EventsLog
+      AttributeDefinitions:
+        - AttributeName: date
+          AttributeType: S
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: date
+          KeyType: HASH
+        - AttributeName: eventId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+      GlobalSecondaryIndexes:
+        - IndexName: SeverityIndex
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Include all attributes in the index
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Include all attributes in the index
+
+      Tags:
+        - Key: Application
+          Value: AIIncidentManager
+
+  DummyErrorLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: DummyErrorLambda
+      Handler: dummy_lambda.lambda_handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 10
+      Description: Simulates a failure to produce CloudWatch error logs
+      CodeUri: dummy/
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  AlertLambdaCustomRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GeneralInlinePolicies
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - ses:*
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0
+                  - !Sub
+                    - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+                    - { TableName: !Ref AIIncidentEventsTable }
+                  - !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+  AlertLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: AlertLambda
+      Handler: alert_lambda.lambda_handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 600
+      Description: Analyses the alerts raised by CloudWatch and initiates a notification
+      CodeUri: alert/
+      Role: !GetAtt AlertLambdaCustomRole.Arn
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref AIIncidentEventsTable
+          EMAIL_TO: "cafixob830@exitbit.com"
+
+  DashboardLambdaCustomRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccessPolicies
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:BatchGetItem"
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:ConditionCheckItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:DescribeTable"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !GetAtt AIIncidentEventsTable.Arn
+                  - !Sub "${AIIncidentEventsTable.Arn}/index/*"
+
+  DashboardLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Dashboard
+      Handler: lambda_handler.lambda_handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 600
+      Description: Function to handle all Dashboard related queries
+      CodeUri: dashboard/
+      Role: !GetAtt DashboardLambdaCustomRole.Arn
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref AIIncidentEventsTable
+
+  AIIncidentAlertAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: AIIncidentAlertAPI
+      Description: "API collections for AI incident alert system"
+
+  # API Gateway Resource (endpoint) for simulating errors
+  SimulateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt AIIncidentAlertAPI.RootResourceId
+      RestApiId: !Ref AIIncidentAlertAPI
+      PathPart: simulate
+
+  # API Gateway Resource (endpoint) for getting dashboard details
+  IncidentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt AIIncidentAlertAPI.RootResourceId
+      RestApiId: !Ref AIIncidentAlertAPI
+      PathPart: incidents
+
+  # API Gateway Method (POST) for simulate resource
+  SimulateResourceMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref SimulateResource
+      RestApiId: !Ref AIIncidentAlertAPI
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DummyErrorLambda.Arn}/invocations
+
+  # API Gateway Method (POST) for incident resource
+  IncidentPostResourceMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref IncidentResource
+      RestApiId: !Ref AIIncidentAlertAPI
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardLambda.Arn}/invocations
+
+  # Dummy Error Lambda Function Permissions to API Gateway
+  ApiGatewayInvokeDummyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DummyErrorLambda
+      Principal: apigateway.amazonaws.com
+
+  # Dashboard Lambda Function Permissions to API Gateway
+  ApiGatewayInvokeDashboardLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DashboardLambda
+      Principal: apigateway.amazonaws.com
+
+  # API Gateway Deployment
+  AIIncidentAlertAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SimulateResourceMethod
+      - IncidentPostResourceMethod
+    Properties:
+      RestApiId: !Ref AIIncidentAlertAPI
+      StageName: prod
+
+Outputs:
+  IncidentTableName:
+    Description: Name of the DynamoDB table for incident events
+    Value: !Ref AIIncidentEventsTable
+    Export:
+      Name: IncidentEventsTableName
+  SimulateAPIUrl:
+    Description: "URL of the Simulate API"
+    Value: !Sub "https://${AIIncidentAlertAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/simulate"
+  DashboardAPIUrl:
+    Description: "URL of the Dashboard API"
+    Value: !Sub "https://${AIIncidentAlertAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/incident"
